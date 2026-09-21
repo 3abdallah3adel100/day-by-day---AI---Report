@@ -260,6 +260,66 @@ def extract_creative_permalink(creative, ad_id=""):
     return ""
 
 
+def extract_page_id_from_creative(creative):
+    """Best-effort Facebook Page ID extraction from an ad creative."""
+    if not isinstance(creative, dict):
+        return ""
+
+    story = creative.get("object_story_spec")
+    if isinstance(story, dict):
+        page_id = str(story.get("page_id") or "").strip()
+        if page_id:
+            return page_id
+
+    for key in ["effective_object_story_id", "object_story_id"]:
+        story_id = str(creative.get(key) or "").strip()
+        if "_" in story_id:
+            page_id = story_id.split("_", 1)[0].strip()
+            if page_id:
+                return page_id
+
+    return ""
+
+
+def extract_page_id_from_promoted_object(promoted_object):
+    """Fallback Page ID extraction from an Ad Set promoted_object payload."""
+    if not isinstance(promoted_object, dict):
+        return ""
+
+    page_id = str(promoted_object.get("page_id") or "").strip()
+    if page_id:
+        return page_id
+
+    for value in promoted_object.values():
+        if isinstance(value, dict):
+            nested = extract_page_id_from_promoted_object(value)
+            if nested:
+                return nested
+    return ""
+
+
+@st.cache_data(ttl=1800)
+def get_page_name(page_id):
+    """Resolve a Facebook Page ID to its current Page name when the token can read it."""
+    page_id = str(page_id or "").strip()
+    if not page_id:
+        return ""
+
+    try:
+        url = f"{BASE_URL}/{API_VERSION}/{page_id}"
+        params = {
+            "fields": "id,name",
+            "access_token": ACCESS_TOKEN,
+        }
+        response = requests.get(url, params=params, timeout=45)
+        response.raise_for_status()
+        payload = response.json()
+        return str(payload.get("name") or "").strip()
+    except Exception:
+        # Page-name enrichment must never break the reporting refresh.
+        return ""
+
+
 def extract_whatsapp_number(promoted_object):
     if not isinstance(promoted_object, dict):
         return ""
@@ -1181,7 +1241,7 @@ def get_campaigns(account_id):
     clean_id = str(account_id).replace("act_", "")
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/campaigns"
     params = {
-        "fields": "id,name,status,effective_status,daily_budget,lifetime_budget,bid_strategy",
+        "fields": "id,name,status,effective_status,created_time,daily_budget,lifetime_budget,bid_strategy",
         "access_token": ACCESS_TOKEN,
         "limit": 1000,
     }
@@ -1212,6 +1272,7 @@ def get_adsets(account_id):
         if "promoted_object" not in df.columns:
             df["promoted_object"] = None
         df["whatsapp_number"] = df["promoted_object"].apply(extract_whatsapp_number)
+        df["page_id"] = df["promoted_object"].apply(extract_page_id_from_promoted_object)
     return df
 
 
@@ -1234,6 +1295,7 @@ def get_ads_metadata(account_id):
         primary_text, headline = extract_creative_texts(creative)
         ad_id = str(row.get("id") or "")
         creative_permalink = extract_creative_permalink(creative, ad_id)
+        page_id = extract_page_id_from_creative(creative)
         processed.append({
             "id": ad_id,
             "name": row.get("name", ""),
@@ -1244,8 +1306,17 @@ def get_ads_metadata(account_id):
             "primary_text": primary_text,
             "headline": headline,
             "creative_permalink": creative_permalink,
+            "page_id": page_id,
             "account_id": f"act_{clean_id}",
         })
+
+    page_names = {}
+    for page_id in sorted({str(item.get("page_id") or "").strip() for item in processed if item.get("page_id")}):
+        page_names[page_id] = get_page_name(page_id)
+
+    for item in processed:
+        item["page_name"] = page_names.get(str(item.get("page_id") or "").strip(), "")
+
     return pd.DataFrame(processed)
 
 @st.cache_data(ttl=1800)
@@ -1578,12 +1649,13 @@ def prepare_data(all_campaigns_df, all_adsets_df, all_ads_df, all_insights_df):
         campaigns_map = all_campaigns_df.copy()
         campaigns_map["campaign_id"] = campaigns_map["id"].astype(str)
         campaigns_map["_account_id_clean"] = campaigns_map["account_id"].apply(normalize_account_id)
-        keep = ["campaign_id", "_account_id_clean", "name", "status", "effective_status", "daily_budget", "lifetime_budget", "bid_strategy"]
+        keep = ["campaign_id", "_account_id_clean", "name", "status", "effective_status", "created_time", "daily_budget", "lifetime_budget", "bid_strategy"]
         keep = [c for c in keep if c in campaigns_map.columns]
         campaigns_map = campaigns_map[keep].rename(columns={
             "name": "campaign_name_master",
             "status": "campaign_status_raw",
             "effective_status": "campaign_effective_status",
+            "created_time": "campaign_created_time",
             "daily_budget": "campaign_daily_budget",
             "lifetime_budget": "campaign_lifetime_budget",
             "bid_strategy": "campaign_bid_strategy",
@@ -1595,6 +1667,7 @@ def prepare_data(all_campaigns_df, all_adsets_df, all_ads_df, all_insights_df):
         fact["campaign_name_master"] = None
         fact["campaign_status_raw"] = None
         fact["campaign_effective_status"] = None
+        fact["campaign_created_time"] = None
         fact["campaign_daily_budget"] = 0
         fact["campaign_lifetime_budget"] = 0
 
@@ -1603,12 +1676,13 @@ def prepare_data(all_campaigns_df, all_adsets_df, all_ads_df, all_insights_df):
         adsets_map = all_adsets_df.copy()
         adsets_map["adset_id"] = adsets_map["id"].astype(str)
         keep = [
-            "adset_id", "name", "optimization_goal", "destination_type", "whatsapp_number",
+            "adset_id", "name", "optimization_goal", "destination_type", "whatsapp_number", "page_id",
             "daily_budget", "lifetime_budget", "status", "effective_status",
         ]
         keep = [c for c in keep if c in adsets_map.columns]
         adsets_map = adsets_map[keep].drop_duplicates(subset=["adset_id"]).rename(columns={
             "name": "adset_name_master",
+            "page_id": "adset_page_id",
             "daily_budget": "adset_daily_budget",
             "lifetime_budget": "adset_lifetime_budget",
             "status": "adset_status_raw",
@@ -1620,6 +1694,7 @@ def prepare_data(all_campaigns_df, all_adsets_df, all_ads_df, all_insights_df):
         fact["optimization_goal"] = ""
         fact["destination_type"] = ""
         fact["whatsapp_number"] = ""
+        fact["adset_page_id"] = ""
         fact["adset_daily_budget"] = 0
         fact["adset_lifetime_budget"] = 0
 
@@ -1627,7 +1702,7 @@ def prepare_data(all_campaigns_df, all_adsets_df, all_ads_df, all_insights_df):
     if not all_ads_df.empty:
         ads_map = all_ads_df.copy()
         ads_map["ad_id"] = ads_map["id"].astype(str)
-        keep = ["ad_id", "name", "primary_text", "headline", "creative_permalink", "status", "effective_status"]
+        keep = ["ad_id", "name", "primary_text", "headline", "creative_permalink", "page_id", "page_name", "status", "effective_status"]
         keep = [c for c in keep if c in ads_map.columns]
         ads_map = ads_map[keep].drop_duplicates(subset=["ad_id"]).rename(columns={
             "name": "ad_name_master",
@@ -1640,6 +1715,8 @@ def prepare_data(all_campaigns_df, all_adsets_df, all_ads_df, all_insights_df):
         fact["primary_text"] = ""
         fact["headline"] = ""
         fact["creative_permalink"] = ""
+        fact["page_id"] = ""
+        fact["page_name"] = ""
 
     if "campaign_name" not in fact.columns:
         fact["campaign_name"] = fact.get("campaign_name_master")
@@ -1699,10 +1776,51 @@ def prepare_data(all_campaigns_df, all_adsets_df, all_ads_df, all_insights_df):
         lambda r: "CBO" if (r.get("campaign_daily_budget", 0) > 0 or r.get("campaign_lifetime_budget", 0) > 0) else "ABO",
         axis=1,
     )
+
+    # Meta returns budget fields in the currency's minor unit (e.g. 10000 = 100.00 EGP/USD).
+    # For the detailed Ad/Ad Set rows, Daily Budget is the budget that actually controls delivery:
+    # CBO -> Campaign daily budget, ABO -> Ad Set daily budget.
+    fact["daily_budget"] = fact.apply(
+        lambda r: (
+            r.get("campaign_daily_budget", 0) / 100.0
+            if r.get("budget_type") == "CBO"
+            else r.get("adset_daily_budget", 0) / 100.0
+        ),
+        axis=1,
+    )
+
+    # Campaign creation time converted to Cairo time and made timezone-naive for Streamlit/Excel compatibility.
+    if "campaign_created_time" not in fact.columns:
+        fact["campaign_created_time"] = None
+    campaign_created = pd.to_datetime(fact["campaign_created_time"], errors="coerce", utc=True)
+    try:
+        fact["campaign_created_at"] = campaign_created.dt.tz_convert("Africa/Cairo").dt.tz_localize(None)
+    except Exception:
+        fact["campaign_created_at"] = campaign_created.dt.tz_localize(None)
+
     fact["performance_goal"] = fact.get("optimization_goal", "").fillna("") if isinstance(fact.get("optimization_goal"), pd.Series) else ""
     fact["whatsapp_number"] = fact.get("whatsapp_number", "").fillna("") if isinstance(fact.get("whatsapp_number"), pd.Series) else ""
     fact["primary_text"] = fact.get("primary_text", "").fillna("") if isinstance(fact.get("primary_text"), pd.Series) else ""
     fact["headline"] = fact.get("headline", "").fillna("") if isinstance(fact.get("headline"), pd.Series) else ""
+
+    # Page attribution: prefer the Page attached to the Ad creative, then fall back to the Ad Set promoted_object.
+    if "page_id" not in fact.columns:
+        fact["page_id"] = ""
+    if "adset_page_id" not in fact.columns:
+        fact["adset_page_id"] = ""
+    fact["page_id"] = fact["page_id"].fillna("").astype(str).str.strip()
+    fact["adset_page_id"] = fact["adset_page_id"].fillna("").astype(str).str.strip()
+    fact.loc[fact["page_id"] == "", "page_id"] = fact.loc[fact["page_id"] == "", "adset_page_id"]
+
+    if "page_name" not in fact.columns:
+        fact["page_name"] = ""
+    fact["page_name"] = fact["page_name"].fillna("").astype(str).str.strip()
+    missing_page_name_ids = sorted(set(
+        fact.loc[(fact["page_name"] == "") & (fact["page_id"] != ""), "page_id"].tolist()
+    ))
+    fallback_page_names = {page_id: get_page_name(page_id) for page_id in missing_page_name_ids}
+    missing_mask = (fact["page_name"] == "") & (fact["page_id"] != "")
+    fact.loc[missing_mask, "page_name"] = fact.loc[missing_mask, "page_id"].map(fallback_page_names).fillna("")
 
     fact["ad_link"] = fact.apply(lambda r: make_ads_manager_link(r.get("account_id"), r.get("ad_id")), axis=1)
     fact["creative_link"] = fact.get("creative_permalink", "").fillna("") if isinstance(fact.get("creative_permalink"), pd.Series) else ""
@@ -2166,10 +2284,10 @@ def build_campaign_summary(fact):
 
 
 REPORT_AD_COLUMNS = [
-    "Created Date", "Agent Code", "Agent", "Ad Account", "Campaign", "Ad Set", "Ad",
+    "Created Date", "Agent Code", "Agent", "Ad Account", "Page Name", "Campaign", "Campaign Created At", "Ad Set", "Ad",
     "Spend", "Results", "CPL", "Impressions", "CPM", "Link Clicks", "CPC", "CTR",
     "Reach", "Frequency", "WhatsApp/Messaging conversations started", "WhatsApp Number",
-    "Optimization Goal / Performance Goal", "ABO / CBO", "Primary Text", "Head line",
+    "Optimization Goal / Performance Goal", "ABO / CBO", "Daily Budget", "Primary Text", "Head line",
     "Campaign ID", "Adset ID", "AD ID", "AD Link",
 ]
 
@@ -2184,7 +2302,9 @@ def build_daily_ad_report(fact):
         "Agent Code": df.get("buyer_code", "UNKNOWN"),
         "Agent": df.get("media_buyer", "Unknown"),
         "Ad Account": df.get("account_name", "Unknown"),
+        "Page Name": df.get("page_name", ""),
         "Campaign": df.get("campaign_name", "Unknown"),
+        "Campaign Created At": pd.to_datetime(df.get("campaign_created_at"), errors="coerce"),
         "Ad Set": df.get("adset_name", "Unknown"),
         "Ad": df.get("ad_name", "Unknown"),
         "Spend": pd.to_numeric(df.get("spend", 0), errors="coerce").fillna(0),
@@ -2197,6 +2317,7 @@ def build_daily_ad_report(fact):
         "WhatsApp Number": df.get("whatsapp_number", ""),
         "Optimization Goal / Performance Goal": df.get("performance_goal", ""),
         "ABO / CBO": df.get("budget_type", ""),
+        "Daily Budget": pd.to_numeric(df.get("daily_budget", 0), errors="coerce").fillna(0),
         "Primary Text": df.get("primary_text", ""),
         "Head line": df.get("headline", ""),
         "Campaign ID": df.get("campaign_id", ""),
@@ -2225,15 +2346,16 @@ def aggregate_daily_report(ad_report, level):
         return pd.DataFrame()
 
     if level == "campaign":
-        group_cols = ["Created Date", "Agent Code", "Agent", "Ad Account", "Campaign", "ABO / CBO", "Campaign ID"]
-        carry_cols = []
+        group_cols = [
+            "Created Date", "Agent Code", "Agent", "Ad Account", "Campaign",
+            "Campaign Created At", "ABO / CBO", "Campaign ID",
+        ]
     elif level == "adset":
         group_cols = [
-            "Created Date", "Agent Code", "Agent", "Ad Account", "Campaign", "Ad Set",
-            "WhatsApp Number", "Optimization Goal / Performance Goal", "ABO / CBO",
+            "Created Date", "Agent Code", "Agent", "Ad Account", "Campaign", "Campaign Created At", "Ad Set",
+            "WhatsApp Number", "Optimization Goal / Performance Goal", "ABO / CBO", "Daily Budget",
             "Campaign ID", "Adset ID",
         ]
-        carry_cols = []
     elif level == "ad":
         return ad_report.copy()
     else:
@@ -2248,6 +2370,40 @@ def aggregate_daily_report(ad_report, level):
         .sum()
         .reset_index()
     )
+
+    # A campaign/ad set can contain ads from more than one Page. Keep one reporting row and join unique Page names.
+    if "Page Name" in ad_report.columns:
+        page_summary = (
+            ad_report.groupby(group_cols, dropna=False)["Page Name"]
+            .agg(lambda values: _unique_join(values))
+            .reset_index()
+        )
+        out = out.merge(page_summary, on=group_cols, how="left")
+    else:
+        out["Page Name"] = ""
+
+    if level == "campaign":
+        # CBO: one campaign budget. ABO: sum each Ad Set budget once (avoid duplicate Ads).
+        budget_rows = ad_report[
+            ["Created Date", "Campaign ID", "ABO / CBO", "Adset ID", "Daily Budget"]
+        ].copy()
+        budget_rows["Daily Budget"] = pd.to_numeric(budget_rows["Daily Budget"], errors="coerce").fillna(0)
+
+        def _campaign_budget(group):
+            budget_type = str(group["ABO / CBO"].iloc[0]) if not group.empty else ""
+            if budget_type == "CBO":
+                return float(group["Daily Budget"].max()) if not group.empty else 0.0
+            unique_adsets = group.drop_duplicates(subset=["Adset ID"])
+            return float(unique_adsets["Daily Budget"].sum())
+
+        budget_summary = (
+            budget_rows.groupby(["Created Date", "Campaign ID"], dropna=False)
+            .apply(_campaign_budget, include_groups=False)
+            .reset_index(name="Daily Budget")
+        )
+        out = out.merge(budget_summary, on=["Created Date", "Campaign ID"], how="left")
+        out["Daily Budget"] = pd.to_numeric(out["Daily Budget"], errors="coerce").fillna(0)
+
     out["CPL"] = out.apply(lambda r: safe_div(r["Spend"], r["Results"]), axis=1)
     out["CPM"] = out.apply(lambda r: safe_div(r["Spend"], r["Impressions"]) * 1000 if r["Impressions"] > 0 else None, axis=1)
     out["CPC"] = out.apply(lambda r: safe_div(r["Spend"], r["Link Clicks"]), axis=1)
@@ -2256,16 +2412,16 @@ def aggregate_daily_report(ad_report, level):
 
     if level == "campaign":
         ordered = [
-            "Created Date", "Agent Code", "Agent", "Ad Account", "Campaign",
+            "Created Date", "Agent Code", "Agent", "Ad Account", "Page Name", "Campaign", "Campaign Created At",
             "Spend", "Results", "CPL", "Impressions", "CPM", "Link Clicks", "CPC", "CTR",
-            "Reach", "Frequency", "WhatsApp/Messaging conversations started", "ABO / CBO", "Campaign ID",
+            "Reach", "Frequency", "WhatsApp/Messaging conversations started", "ABO / CBO", "Daily Budget", "Campaign ID",
         ]
     else:
         ordered = [
-            "Created Date", "Agent Code", "Agent", "Ad Account", "Campaign", "Ad Set",
+            "Created Date", "Agent Code", "Agent", "Ad Account", "Page Name", "Campaign", "Campaign Created At", "Ad Set",
             "Spend", "Results", "CPL", "Impressions", "CPM", "Link Clicks", "CPC", "CTR",
             "Reach", "Frequency", "WhatsApp/Messaging conversations started", "WhatsApp Number",
-            "Optimization Goal / Performance Goal", "ABO / CBO", "Campaign ID", "Adset ID",
+            "Optimization Goal / Performance Goal", "ABO / CBO", "Daily Budget", "Campaign ID", "Adset ID",
         ]
 
     return out[ordered].sort_values(
@@ -2314,7 +2470,10 @@ def _write_excel_sheet(writer, sheet_name, df):
         if col_name == "Created Date":
             fmt = date_fmt
             width = 13
-        elif col_name in {"Spend", "CPL", "CPM", "CPC"}:
+        elif col_name == "Campaign Created At":
+            fmt = workbook.add_format({"num_format": "yyyy-mm-dd hh:mm"})
+            width = 19
+        elif col_name in {"Spend", "CPL", "CPM", "CPC", "Daily Budget"}:
             fmt = money_fmt
             width = 12
         elif col_name in {"Results", "Impressions", "Link Clicks", "Reach", "WhatsApp/Messaging conversations started"}:
@@ -2326,6 +2485,8 @@ def _write_excel_sheet(writer, sheet_name, df):
         elif col_name == "AD Link":
             fmt = link_fmt
             width = 22
+        elif col_name == "Page Name":
+            width = max(width, 24)
         elif col_name in {"Primary Text", "Head line"}:
             width = 42 if col_name == "Primary Text" else 30
 
@@ -2917,7 +3078,7 @@ daily_report_df = build_daily_ad_report(filtered_fact_main)
 if daily_report_df.empty:
     st.info("No day-by-day ad data found for the loaded range.")
 else:
-    st.caption("One row per day per ad. Created Date = the reporting day from Meta Insights.")
+    st.caption("One row per day per ad. Page Name = Facebook Page used by the ad creative (with Ad Set fallback). Created Date = reporting day. Campaign Created At = when the campaign was originally created. Daily Budget = CBO campaign budget or ABO ad-set budget.")
     st.dataframe(daily_report_df, use_container_width=True, hide_index=True, height=520)
 
     excel_bytes = build_excel_report_bytes(filtered_fact_main)
