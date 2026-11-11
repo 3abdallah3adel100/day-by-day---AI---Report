@@ -135,3 +135,15 @@ The access token must be able to read the configured ad accounts and their insig
 Changing the Time selector does **not** mutate the saved data by itself. Select the range and click **Refresh Data**. The Excel button exports the saved snapshot displayed in the dashboard.
 
 The app stores its local snapshot files under `app_data/`. Streamlit Community Cloud local disk is not guaranteed to be permanent across restarts, so if the container restarts you may need to refresh the data again.
+
+
+## Two Meta access tokens (Streamlit)
+
+Copy `secrets.toml.example` into Streamlit App Settings → Secrets and fill in
+`META_ACCESS_TOKEN` and `META_ACCESS_TOKEN_2`. Keep the WhatsApp settings as they are.
+Either Meta token can be used on its own; the second token is optional.
+Discovery reads both tokens and deduplicates accounts before fetching performance.
+Account data, creatives, page names and balances retry the other token on API errors.
+Pagination restarts on fallback, so partial pages are never added twice.
+After saving Secrets and restarting the app, click **Refresh Data** to rebuild the
+saved snapshot with both tokens. Never commit real tokens to the repository.

@@ -5,6 +5,7 @@ import time
 import threading
 import uuid
 import requests
+from meta_tokens import MetaTokenClient
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -39,7 +40,15 @@ if not check_password():
 
 BASE_URL = "https://graph.facebook.com"
 API_VERSION = st.secrets.get("META_API_VERSION", "v26.0")
-ACCESS_TOKEN = st.secrets["META_ACCESS_TOKEN"]
+META_TOKENS = {}
+for token_key, secret_name in (("token_1", "META_ACCESS_TOKEN"), ("token_2", "META_ACCESS_TOKEN_2")):
+    token = str(st.secrets.get(secret_name, "") or "").strip()
+    if token and token not in META_TOKENS.values():
+        META_TOKENS[token_key] = token
+if not META_TOKENS:
+    st.error("Add META_ACCESS_TOKEN and/or META_ACCESS_TOKEN_2 in Streamlit Secrets.")
+    st.stop()
+META_CLIENT = MetaTokenClient(META_TOKENS)
 BUSINESS_IDS = ["751488620224306", "1178859133269743"]
 FETCH_CAMPAIGNS = True  # Needed to fetch campaign status (Active / Not Active)
 REFRESH_LOCK_MAX_AGE_SECONDS = 10 * 60
@@ -309,11 +318,8 @@ def get_page_name(page_id):
         url = f"{BASE_URL}/{API_VERSION}/{page_id}"
         params = {
             "fields": "id,name",
-            "access_token": ACCESS_TOKEN,
         }
-        response = requests.get(url, params=params, timeout=45)
-        response.raise_for_status()
-        payload = response.json()
+        payload = META_CLIENT.get_object(url, params, timeout=45)
         return str(payload.get("name") or "").strip()
     except Exception:
         # Page-name enrichment must never break the reporting refresh.
@@ -1165,25 +1171,8 @@ def load_snapshot():
 # API
 # -----------------------------
 @st.cache_data(ttl=1800)
-def fetch_all_pages(url, params=None):
-    all_rows = []
-
-    while True:
-        response = requests.get(url, params=params, timeout=90)
-        response.raise_for_status()
-        data = response.json()
-
-        all_rows.extend(data.get("data", []))
-
-        paging = data.get("paging", {})
-        next_url = paging.get("next")
-        if not next_url:
-            break
-
-        url = next_url
-        params = None
-
-    return all_rows
+def fetch_all_pages(url, params=None, token_key=None):
+    return META_CLIENT.fetch_all_pages(url, params, token_key=token_key)
 
 @st.cache_data(ttl=1800)
 def get_ad_accounts():
@@ -1198,20 +1187,24 @@ def get_ad_accounts():
             (f"business/{business_id}/client_ad_accounts", f"{BASE_URL}/{API_VERSION}/{business_id}/client_ad_accounts"),
         ])
 
-    for source_name, url in sources:
-        try:
-            params = {
-                "fields": "id,account_id,name,account_status,currency,funding_source_details",
-                "access_token": ACCESS_TOKEN,
-                "limit": 500,
-            }
-            rows = fetch_all_pages(url, params)
-            df = pd.DataFrame(rows)
-            if not df.empty:
-                df["source"] = source_name
-                all_dfs.append(df)
-        except Exception:
-            pass
+    discovery_errors = []
+    for token_key in META_TOKENS:
+        for source_name, url in sources:
+            try:
+                params = {
+                    "fields": "id,account_id,name,account_status,currency,funding_source_details",
+                    "limit": 500,
+                }
+                rows = fetch_all_pages(url, params, token_key=token_key)
+                df = pd.DataFrame(rows)
+                if not df.empty:
+                    df["source"] = source_name
+                    df["token_key"] = token_key
+                    all_dfs.append(df)
+            except Exception as exc:
+                discovery_errors.append(f"{source_name}: {exc}")
+    if discovery_errors:
+        st.warning("Some Meta account sources were unavailable: " + " | ".join(discovery_errors))
 
     if not all_dfs:
         return pd.DataFrame(), pd.DataFrame()
@@ -1242,7 +1235,6 @@ def get_campaigns(account_id):
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/campaigns"
     params = {
         "fields": "id,name,status,effective_status,created_time,daily_budget,lifetime_budget,bid_strategy",
-        "access_token": ACCESS_TOKEN,
         "limit": 1000,
     }
     rows = fetch_all_pages(url, params)
@@ -1262,7 +1254,6 @@ def get_adsets(account_id):
             "optimization_goal", "destination_type", "promoted_object",
             "daily_budget", "lifetime_budget",
         ]),
-        "access_token": ACCESS_TOKEN,
         "limit": 1000,
     }
     rows = fetch_all_pages(url, params)
@@ -1285,7 +1276,6 @@ def get_ads_metadata(account_id):
             "id", "name", "campaign_id", "adset_id", "status", "effective_status",
             "creative{id,name,body,title,object_story_id,effective_object_story_id,instagram_permalink_url,link_url,object_story_spec,asset_feed_spec}",
         ]),
-        "access_token": ACCESS_TOKEN,
         "limit": 1000,
     }
     rows = fetch_all_pages(url, params)
@@ -1325,7 +1315,6 @@ def get_campaign_creative_links(account_id):
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/ads"
     params = {
         "fields": "id,campaign_id,effective_status,creative{effective_object_story_id,instagram_permalink_url,effective_instagram_media_id}",
-        "access_token": ACCESS_TOKEN,
         "limit": 1000,
     }
 
@@ -1402,7 +1391,6 @@ def get_insights_for_account(account_id, since, until):
         "level": "ad",
         "time_increment": 1,
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "access_token": ACCESS_TOKEN,
         "limit": 1000,
     }
 
@@ -1422,7 +1410,6 @@ def get_gender_spend(account_id, since, until):
         "fields": "spend",
         "breakdowns": "gender",
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "access_token": ACCESS_TOKEN,
         "limit": 1000,
     }
 
@@ -1447,7 +1434,6 @@ def get_age_spend(account_id, since, until):
         "fields": "spend",
         "breakdowns": "age",
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "access_token": ACCESS_TOKEN,
         "limit": 1000,
     }
 
@@ -1472,7 +1458,6 @@ def get_age_gender_spend(account_id, since, until):
         "fields": "spend",
         "breakdowns": "age,gender",
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "access_token": ACCESS_TOKEN,
         "limit": 1000,
     }
 
@@ -1528,12 +1513,9 @@ def get_account_balance(account_id):
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}"
     params = {
         "fields": "name,funding_source_details",
-        "access_token": ACCESS_TOKEN,
     }
 
-    response = requests.get(url, params=params, timeout=90)
-    response.raise_for_status()
-    data = response.json()
+    data = META_CLIENT.get_object(url, params)
 
     display_string = None
     if isinstance(data.get("funding_source_details"), dict):
@@ -2825,6 +2807,8 @@ if refresh_clicked:
         st.stop()
 
     try:
+        # Explicit refresh must include newly configured tokens and current data.
+        st.cache_data.clear()
         old_snapshot = load_snapshot()
 
         with st.status("Refreshing data in background-like flow...", expanded=True) as status:
